@@ -94,11 +94,58 @@ pub mod pallet {
 			metadata: BoundedVec<u8, T::MaxLength>,
 			supply: u128,
 		) -> DispatchResult {
+			let origin = ensure_signed(origin)?;
+			(supply > 0).then_some(()).ok_or(Error::<T>::NoSupply)?;
+
+			let id = Self::nonce();
+			let details = UniqueAssetDetails::new(
+				origin.clone(),
+				metadata,
+				supply,
+			);
+
+			UniqueAsset::<T>::insert(id, details);
+			Nonce::<T>::set(id.saturating_add(1));
+
+			Account::<T>::mutate(id, origin.clone(), |balance| {
+				*balance += supply;
+			});
+
+			Self::deposit_event(Event::<T>::Created {
+				creator: origin,
+				asset_id: id,
+			});
+
 			Ok(())
 		}
 
 		#[pallet::weight(0)]
 		pub fn burn(origin: OriginFor<T>, asset_id: UniqueAssetId, amount: u128) -> DispatchResult {
+			let origin = ensure_signed(origin)?;
+			Self::ensure_is_owner(asset_id, origin.clone())?;
+
+			let mut burned_amount = 0;
+			Account::<T>::mutate(asset_id, origin.clone(), |balance| {
+				let old_balance = *balance;
+				*balance = balance.saturating_sub(amount);
+				burned_amount = old_balance - *balance;
+			});
+
+			UniqueAsset::<T>::try_mutate(asset_id, |maybe_details| -> DispatchResult {
+				let details = maybe_details.as_mut().ok_or(Error::<T>::UnknownAssetId)?;
+
+				details.supply -= burned_amount;
+
+				Ok(())
+			})?;
+
+			let total_supply = UniqueAsset::<T>::get(asset_id).ok_or(Error::<T>::UnknownAssetId)?.supply;
+			Self::deposit_event(Event::<T>::Burned {
+				asset_id,
+				owner: origin,
+				total_supply,
+			});
+
 			Ok(())
 		}
 
@@ -109,7 +156,41 @@ pub mod pallet {
 			amount: u128,
 			to: T::AccountId,
 		) -> DispatchResult {
+			let origin = ensure_signed(origin)?;
+			Self::ensure_is_owner(asset_id, origin.clone())?;
+
+			let mut transfered_amount = 0;
+
+			Account::<T>::mutate(asset_id, origin.clone(), |balance| {
+				let old_balance = *balance;
+				*balance = balance.saturating_sub(amount);
+				transfered_amount = old_balance - *balance;
+			});
+
+			Account::<T>::mutate(asset_id, to.clone(), |balance| {
+				*balance += transfered_amount;
+			});
+
+			Self::deposit_event(Event::<T>::Transferred {
+				asset_id,
+				from: origin,
+				to,
+				amount: transfered_amount,
+			});
+
 			Ok(())
 		}
+	}
+}
+
+impl<T: Config> Pallet<T> {
+	// This is not a call, so it cannot be called directly by real-world users.
+	// Still it has to be generic over the runtime types, and that's why we implement it on Pallet
+	// rather than just defining a local function.
+	fn ensure_is_owner(asset_id: UniqueAssetId, account: T::AccountId) -> Result<(), Error<T>> {
+		let details = Self::unique_asset(asset_id).ok_or(Error::<T>::UnknownAssetId)?;
+		ensure!(details.creator() == account, Error::<T>::NotOwned);
+
+		Ok(())
 	}
 }
